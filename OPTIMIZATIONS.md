@@ -74,6 +74,26 @@ upgrade task, name correction) are still unacked.
    fallback incl. a real local server, resend cap/dead-letter, doctor
    structure).
 
+## Round 3 — curl as primary transport (2026-11-16)
+
+`http()` now tries the curl binary first and falls back to urllib
+(`MUSEBOT_TRANSPORT=urllib` forces the old path). Rationale: in a
+10×10 test curl went 10/10 against ntfy while urllib went 9/10, and
+during the outage curl succeeded while urllib failed. Streams still
+use urllib (long-lived SSE), but they fall back to `poll_topic`,
+which now goes through curl-primary `http()`. 3 more tests, total
+**26/26 pass**.
+
+Honest status after deploying round 3: curl-primary helps but does
+**not** fully fix the peer traffic. At 02:00 the doctor topic
+published+polled fine via curl, while peer-topic publish/poll in the
+same minute failed in *both* curl (exit 35, SSL wrong version
+number) and urllib. So the failure is per-connection through the
+egress proxy, not per-client — the proxy intermittently returns a
+plain-HTTP error on CONNECT, and which calls survive is luck of the
+draw. The 4 upgrade messages to 小一 are at 5 resend tries each and
+still unacked; 小一 has been offline since 01:25:20.
+
 ## How a peer upgrades (manual, not automatic)
 
 There is **no auto-upgrade** in MuseBot: each node runs its own local

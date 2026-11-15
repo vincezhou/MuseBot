@@ -7,7 +7,10 @@ Design (protocol v6):
 - peers.json is the address book: one entry per remote node with its own
   ntfy topics (plus mirror), pairing code and AES-256 master key.
   Direction keys are derived per peer via HMAC labels (n2p / p2n).
-- Transport: public ntfy (primary + mirror). The resident watcher uses
+- Transport: public ntfy (primary + mirror). HTTP calls go through
+  curl first (it survives the egress proxy where Python urllib
+  intermittently fails with SSL WRONG_VERSION_NUMBER) and fall back
+  to urllib. The resident watcher uses
   streaming subscriptions (~1s latency), auto-acks everything it ingests,
   resends unacknowledged outgoing messages, dedupes by message id and
   rejects replays older than 7 days.
@@ -57,6 +60,10 @@ MAX_BLOB_BYTES = 50 * 1024 * 1024  # direct_file blob download cap
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024  # small-file attachment cap
 MAX_UNZIP_BYTES = 100 * 1024 * 1024  # total uncompressed zip cap
 HTTP_RETRIES = 3
+# Transport order for http(): "curl" (default) tries the curl binary
+# first and falls back to urllib; "urllib" skips curl entirely.
+# Set MUSEBOT_TRANSPORT=urllib to force the old path for a test.
+TRANSPORT_PRIMARY = os.environ.get("MUSEBOT_TRANSPORT", "curl").lower()
 # Circuit breaker: after N consecutive failures a base is cooled down
 # for this long; publish/poll skip it until the cooldown expires
 # (then one probe is allowed). Counts live in transport/health.json.
@@ -510,7 +517,7 @@ def _http_via_curl(method, url, data=None, headers=None, timeout=30, max_bytes=N
         body = Path(tmp).read_bytes()
         if max_bytes is not None and len(body) > max_bytes:
             raise ValueError(f"response exceeds {max_bytes} bytes from {url}")
-        log("http_curl_fallback", url=url, code=code)
+        log("http_curl", url=url, code=code)
         return body
     finally:
         try:
@@ -522,10 +529,21 @@ def _http_via_curl(method, url, data=None, headers=None, timeout=30, max_bytes=N
 def http(method, url, data=None, headers=None, timeout=30, max_bytes=None, retries=HTTP_RETRIES):
     """One HTTP call with retries + exponential backoff + jitter.
 
+    Primary transport is curl (TRANSPORT_PRIMARY="curl"): on
+    2026-11-16 curl went 10/10 against ntfy while urllib went 9/10,
+    and during the outage curl succeeded while urllib failed with
+    SSL WRONG_VERSION_NUMBER through the egress proxy. If curl is
+    missing or fails, urllib is tried with its usual retries.
     Retries only transient failures (5xx/429, network/SSL errors); a 4xx
     other than 429 fails fast. Reads in chunks so a hostile response
     cannot OOM the watcher when max_bytes is set.
     """
+    if TRANSPORT_PRIMARY == "curl":
+        try:
+            return _http_via_curl(method, url, data=data, headers=headers,
+                                  timeout=timeout, max_bytes=max_bytes)
+        except Exception as curl_e:
+            log("http_curl_primary_failed", url=url, error=str(curl_e)[:120])
     last_exc = None
     for attempt in range(retries + 1):
         try:
@@ -550,14 +568,15 @@ def http(method, url, data=None, headers=None, timeout=30, max_bytes=None, retri
             delay = min(8.0, 1.0 * (2 ** attempt)) + random.random() * 0.5
             log("http_retry", url=url, attempt=attempt + 1, delay=round(delay, 2), error=str(e)[:120])
             time.sleep(delay)
-    # urllib path exhausted: try the curl binary once before giving up.
-    # This is what saved publishes on 2026-11-16 when urllib hit
-    # SSL WRONG_VERSION_NUMBER through the egress proxy and curl worked.
-    try:
-        return _http_via_curl(method, url, data=data, headers=headers,
-                              timeout=timeout, max_bytes=max_bytes)
-    except Exception as curl_e:
-        log("http_curl_fallback_failed", url=url, error=str(curl_e)[:120])
+    # urllib path exhausted. If curl was the primary it already
+    # failed above, so there is nothing left to try; if the primary
+    # was urllib, try curl once as a last resort.
+    if TRANSPORT_PRIMARY != "curl":
+        try:
+            return _http_via_curl(method, url, data=data, headers=headers,
+                                  timeout=timeout, max_bytes=max_bytes)
+        except Exception as curl_e:
+            log("http_curl_fallback_failed", url=url, error=str(curl_e)[:120])
     raise last_exc
 
 def sha256_of(path):
@@ -1657,7 +1676,7 @@ def cmd_doctor(args):
             "transport_sent": sum('"transport_sent"' in l for l in lines),
             "transport_failed": sum('"transport_failed"' in l for l in lines),
             "circuit_open": sum('"circuit_open"' in l for l in lines),
-            "curl_fallback": sum('"http_curl_fallback"' in l for l in lines),
+            "curl_fallback": sum('"http_curl_fallback"' in l or '"http_curl"' in l for l in lines),
             "lines_scanned": len(lines)}
     except Exception as e:
         report["log"] = {"error": str(e)[:120]}

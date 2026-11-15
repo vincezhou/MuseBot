@@ -336,3 +336,30 @@ class TestDoctor(BaseTest):
                 self.assertIn(key, res)
         self.assertIn("unacked", report)
         self.assertIn("log", report)
+
+
+class TestCurlPrimary(BaseTest):
+    def test_http_uses_curl_first_and_skips_urllib(self):
+        with mock.patch.object(relay, "_http_via_curl", return_value=b"via-curl-primary") as curl_mock, \
+             mock.patch.object(relay.urllib.request, "urlopen", side_effect=AssertionError("urllib must not be called")):
+            self.assertEqual(relay.http("GET", "https://example.invalid/x"), b"via-curl-primary")
+        curl_mock.assert_called_once()
+
+    def test_http_falls_back_to_urllib_when_curl_fails(self):
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1): return b"via-urllib"
+        with mock.patch.object(relay, "_http_via_curl", side_effect=ConnectionError("curl down")), \
+             mock.patch.object(relay.urllib.request, "urlopen", lambda *a, **k: Resp()):
+            self.assertEqual(relay.http("GET", "https://example.invalid/x"), b"via-urllib")
+
+    def test_urllib_primary_env_skips_curl(self):
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1): return b"via-urllib"
+        with mock.patch.object(relay, "TRANSPORT_PRIMARY", "urllib"), \
+             mock.patch.object(relay, "_http_via_curl", side_effect=AssertionError("curl must not be called")), \
+             mock.patch.object(relay.urllib.request, "urlopen", lambda *a, **k: Resp()):
+            self.assertEqual(relay.http("GET", "https://example.invalid/x"), b"via-urllib")
