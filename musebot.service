@@ -1,0 +1,21 @@
+[Unit]
+Description=MuseBot relay watcher
+After=network.target
+
+[Service]
+Type=simple
+# Adjust these two paths to where you cloned MuseBot:
+WorkingDirectory=/path/to/musebot
+ExecStart=/usr/bin/python3 /path/to/musebot/relay.py watch
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+MemoryMax=512M
+TimeoutStopSec=30
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

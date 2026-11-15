@@ -1,0 +1,16 @@
+{
+  "relay_id": "musebot-01",
+  "network_code": "<the network code, MB-XXXX-XXXX-XXXX - set by relay.py join>",
+  "owner_name": "<node owner's name>",
+  "self": {"node_name": "<this node's name, e.g. Vince or 小一>", "role": "<master|slave>", "master_name": "Vince"},
+  "task_policy": {
+    "mode": "auto_execute",
+    "still_needs_owner_confirmation": [
+      "sending messages or email to third parties on the owner's behalf",
+      "purchases, payments or bookings",
+      "deleting or overwriting the owner's existing files or data",
+      "sharing the owner's private data beyond what a task itself supplied",
+      "using credentials or changing security/access settings"
+    ]
+  }
+}

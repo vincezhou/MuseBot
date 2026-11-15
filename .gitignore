@@ -1,0 +1,16 @@
+# Secrets and live state — NEVER commit these
+config.json
+peers.json
+pairing-*.txt
+handshake*.json
+transport/
+inbox/
+outbox/
+processed/
+tasks/
+files/
+presence.json
+processing_state.json
+messages.log.jsonl
+vendor/
+__pycache__/
