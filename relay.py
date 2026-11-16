@@ -76,7 +76,10 @@ TRANSPORT_PRIMARY = os.environ.get("MUSEBOT_TRANSPORT", "curl").lower()
 # (then one probe is allowed). Counts live in transport/health.json.
 CIRCUIT_FAIL_THRESHOLD = 3
 CIRCUIT_COOLDOWN_SECS = 300
-MAX_RESEND_ATTEMPTS = 10  # was 20: after this, a message goes to dead-letter
+MAX_RESEND_ATTEMPTS = 10  # kept for reference; round 5 dead-letters by age, not count
+RESEND_MAX_AGE_SECS = 12 * 3600  # ntfy caches messages ~12 h; retry inside that window
+RESEND_MAX_DELAY_SECS = 900  # 15 min: longest gap between resend attempts
+_FLUSH_NEEDED = False  # set when a base recovers from unhealthy; watch loop flushes the outbox
 # Noisy transport events are logged at most once per key per 30 s,
 # so a failing stream cannot flood messages.log.jsonl (it hit 1250
 # identical SSL lines in one hour on 2026-11-16).
@@ -442,10 +445,21 @@ def save_health(h):
         pass
 
 
+def resend_delay(count):
+    """Seconds to wait before the next resend attempt: 60 s, 2 min,
+    4 min, 8 min, then 15 min. Pure function, unit-tested."""
+    return min(RESEND_MAX_DELAY_SECS, 60 * (2 ** max(count, 0)))
+
+
 def record_transport_success(base):
+    global _FLUSH_NEEDED
     h = load_health()
     rec = h.setdefault(base, {"ok": 0, "fail": 0, "consecutive_fail": 0,
                               "unhealthy_until": 0, "last_error": ""})
+    # The base just recovered from a cooldown: this is a good window —
+    # flush the outbox now instead of waiting for the next resend tick.
+    if rec.get("consecutive_fail", 0) >= CIRCUIT_FAIL_THRESHOLD:
+        _FLUSH_NEEDED = True
     rec["ok"] += 1
     rec["consecutive_fail"] = 0
     rec["unhealthy_until"] = 0
@@ -615,7 +629,10 @@ def bases(peer):
     return out
 
 def publish_raw(peer, topic, data, headers=None, base=None):
-    return http("POST", f"{base or peer['base_url']}/{topic}", data=data, headers=headers or {})
+    # Short timeout, one retry: in a bad window a long timeout only
+    # blocks the caller; the resend backoff retries later anyway.
+    return http("POST", f"{base or peer['base_url']}/{topic}", data=data,
+                headers=headers or {}, timeout=10, retries=1)
 
 def transport_publish_envelope(msg, peer):
     ok_any = False
@@ -994,7 +1011,7 @@ def poll_topic(topic, via, base=None):
     for b in all_bases:
         since = state.get("last_event", {}).get(topic + "@" + b) or "all"
         try:
-            raw = http("GET", f"{b}/{topic}/json?poll=1&since={since}", timeout=30)
+            raw = http("GET", f"{b}/{topic}/json?poll=1&since={since}", timeout=10, retries=1)
             record_transport_success(b)
         except Exception as e:
             record_transport_failure(b, e)
@@ -1014,15 +1031,67 @@ def poll_topic(topic, via, base=None):
                     s = load_state(); s.setdefault("last_event", {})[topic + "@" + b] = ev["id"]; save_state(s)
     return total
 
+def _stream_lines_curl(topic, base, stop_flag):
+    """Yield decoded lines from one long-lived curl stream. One
+    CONNECT for the whole stream instead of a fresh TLS handshake
+    per reconnect; curl survived the egress proxy better than urllib
+    in the 2026-11-16 tests (90 s stream held, keepalives received)."""
+    cmd = ["curl", "-s", "-N", "--max-time", "300", f"{base}/{topic}/json"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for raw in iter(proc.stdout.readline, b""):
+            if stop_flag.is_set():
+                break
+            yield raw.decode("utf-8", "replace").strip()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        err = proc.stderr.read().decode("utf-8", "replace").strip() if proc.stderr else ""
+        if proc.returncode not in (0, None) and not stop_flag.is_set():
+            raise RuntimeError(f"curl stream exit {proc.returncode}: {err[:120]}")
+
+
 def stream_topic(topic, via, base, stop_flag):
     failures = 0
     while not stop_flag.is_set():
         try:
+            if shutil.which("curl"):
+                line_iter = _stream_lines_curl(topic, base, stop_flag)
+                connected = False
+                for line in line_iter:
+                    if stop_flag.is_set():
+                        break
+                    if not line:
+                        continue
+                    if not connected:
+                        # First line received: the stream is genuinely
+                        # up (a failed CONNECT raises before any line).
+                        failures = 0
+                        record_transport_success(base)
+                        log("stream_connected", topic=topic, base=base, via="curl")
+                        connected = True
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if ev.get("event") == "keepalive":
+                        continue
+                    handle_event_net(ev, load_state(), via)
+                    if ev.get("id"):
+                        with _lock:
+                            s = load_state(); s.setdefault("last_event", {})[topic + "@" + base] = ev["id"]; save_state(s)
+                if stop_flag.is_set():
+                    break
+                raise RuntimeError("curl stream ended")
             req = urllib.request.Request(f"{base}/{topic}/json")
             with urllib.request.urlopen(req, timeout=120) as r:
                 failures = 0
                 record_transport_success(base)
-                log("stream_connected", topic=topic, base=base)
+                log("stream_connected", topic=topic, base=base, via="urllib")
                 for raw_line in r:
                     if stop_flag.is_set():
                         break
@@ -1078,10 +1147,16 @@ def heartbeat_once(peer):
     transport_publish_envelope(msg, peer)
 
 def resend_unacked():
-    """Re-publish outgoing messages that have no ack yet (max
-    MAX_RESEND_ATTEMPTS tries, only while younger than 12h, at most once
-    per 2 minutes each). Past the cap the message is dead-lettered once
-    in the log instead of being retried forever."""
+    """Re-publish outgoing messages that have no ack yet.
+
+    Round 5: outages last hours, so attempts use exponential backoff
+    (60 s -> 15 min) and continue for the full 12 h ntfy cache window;
+    a message is dead-lettered only when it ages out of the cache.
+    Ack messages are included now (round 4 found two acks that were
+    never resent); heartbeats are still skipped (a fresh one is sent
+    every 5 minutes anyway)."""
+    global _FLUSH_NEEDED
+    _FLUSH_NEEDED = False
     s = load_state(); acked = set(s.get("acked_ids", [])); attempts = s.get("attempts", {})
     changed = False
     for f in sorted(OUTBOX.glob("*.json")):
@@ -1089,24 +1164,23 @@ def resend_unacked():
             msg = json.loads(f.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if msg.get("type") in ("ack", "heartbeat") or msg["id"] in acked:
+        if msg.get("type") == "heartbeat" or msg["id"] in acked:
             continue
         att = attempts.get(msg["id"], {})
-        if att.get("count", 0) >= MAX_RESEND_ATTEMPTS:
+        try:
+            created = datetime.fromisoformat(msg["created_at"]).timestamp()
+            age = now_ts() - created
+        except Exception:
+            age = 0
+        if age > RESEND_MAX_AGE_SECS:
             if not att.get("dead_logged"):
-                log("dead_letter", id=msg["id"], peer=peer["peer_id"] if (peer := get_peer(msg.get("peer_id") or "")) else "",
-                    tries=att.get("count", 0), reason="no ack after max resends")
+                log("dead_letter", id=msg["id"],
+                    tries=att.get("count", 0), reason="aged out of ntfy cache window (12h)")
                 attempts[msg["id"]] = {**att, "dead_logged": True}
                 changed = True
             continue
-        if now_ts() - att.get("last", 0) < 120:
+        if now_ts() - att.get("last", 0) < resend_delay(att.get("count", 0)):
             continue
-        try:
-            created = datetime.fromisoformat(msg["created_at"]).timestamp()
-            if now_ts() - created > 12 * 3600:
-                continue
-        except Exception:
-            pass
         peer = get_peer(msg.get("peer_id") or "")
         if peer is None:
             continue  # never reroute a message to a different peer
@@ -1324,6 +1398,42 @@ def cmd_diagnose(args):
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+_RESEND_LOCK = threading.Lock()
+_RESEND_RUNNING = False
+
+
+def _trigger_resend():
+    """Run resend_unacked in a daemon thread, at most one at a time.
+    The watch loop must never block on slow publishes (round 5b: a
+    5-message resend pass blocked the loop for ~20 min in a bad
+    window, stopping ticks, polls and heartbeats)."""
+    global _RESEND_RUNNING
+    with _RESEND_LOCK:
+        if _RESEND_RUNNING:
+            return
+        _RESEND_RUNNING = True
+
+    def _run():
+        global _RESEND_RUNNING
+        try:
+            resend_unacked()
+        except Exception as e:
+            log("resend_thread_failed", error=str(e)[:120])
+        finally:
+            with _RESEND_LOCK:
+                _RESEND_RUNNING = False
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _liveness_loop(stop_flag):
+    """Ticks every 60 s from their own thread, so a blocked watch
+    loop (or a slow network call) cannot stop the diagnostics log —
+    the gap analysis in `diagnose` depends on ticks being on time."""
+    while not stop_flag.is_set():
+        record_liveness_tick()
+        stop_flag.wait(60)
+
+
 def cmd_watch(args):
     """Resident watcher (network v6 only).
 
@@ -1336,6 +1446,7 @@ def cmd_watch(args):
         sys.exit(1)
     record_startup()
     stop = threading.Event()
+    threading.Thread(target=_liveness_loop, args=(stop,), daemon=True).start()
     threads = []
     code = network_code()
     topics = [(announce_topic(code), "announce"),
@@ -1344,15 +1455,15 @@ def cmd_watch(args):
         t = threading.Thread(target=stream_topic, args=(topic, via, NTFY_BASE, stop), daemon=True)
         t.start(); threads.append(t)
     print(f"watching network streams ({len(threads)}) + local folders", flush=True)
-    last_beat = 0; last_resend = 0; last_mirror_poll = 0; last_tick = 0
+    last_beat = 0; last_resend = 0; last_mirror_poll = 0
     try:
         while True:
             for p in sorted(FROM_PEER.glob("*.json")):
                 ingest_file(p)
             retry_pending()
-            if now_ts() - last_tick > 60:
-                record_liveness_tick(); last_tick = now_ts()
-            if now_ts() - last_mirror_poll > 30:
+            if _FLUSH_NEEDED:
+                _trigger_resend()
+            if now_ts() - last_mirror_poll > 60:
                 for topic, via in topics:
                     try:
                         poll_topic(topic, via, base=NTFY_MIRROR)
@@ -1363,7 +1474,7 @@ def cmd_watch(args):
                 heartbeat_once(broadcast_peer())
                 last_beat = now_ts()
             if now_ts() - last_resend > 60:
-                resend_unacked(); last_resend = now_ts()
+                _trigger_resend(); last_resend = now_ts()
             time.sleep(2)
     except KeyboardInterrupt:
         stop.set()

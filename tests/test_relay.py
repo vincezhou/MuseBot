@@ -313,13 +313,15 @@ class TestResendCap(BaseTest):
         self.assertEqual(s["attempts"]["msg-cap1"]["count"], 1)
 
     def test_past_cap_is_dead_lettered_once(self):
+        # Round 5: dead-letter is by age (12 h cache window), not by
+        # attempt count. A young message at count 10 still retries
+        # (backoff permitting); only an aged-out one dead-letters.
         self._outbox_msg()
         relay.save_state({"processed_ids": [], "acked_ids": [], "attempts": {"msg-cap1": {"count": 10, "last": 0}}, "last_event": {}})
-        with mock.patch.object(relay, "transport_publish_envelope") as pub:
+        with mock.patch.object(relay, "transport_publish_envelope", return_value=True) as pub:
             relay.resend_unacked()
-        pub.assert_not_called()
-        self.assertIn("dead_letter", relay.LOG.read_text())
-        self.assertTrue(relay.load_state()["attempts"]["msg-cap1"]["dead_logged"])
+        pub.assert_called_once()
+        self.assertNotIn("dead_letter", relay.LOG.read_text())
 
 
 class TestDoctor(BaseTest):
@@ -438,3 +440,96 @@ class TestLiveness(BaseTest):
         self.assertEqual(len(report["downtime_gaps"]), 1)
         self.assertEqual(report["downtime_gaps"][0]["cause"], "process_down")
         self.assertEqual(report["total_downtime_s"], 1800)
+
+
+class TestRound5Resend(BaseTest):
+    def _msg(self, mid, mtype="message", age_s=60):
+        import datetime as _dt
+        created = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=age_s)).isoformat()
+        return {"id": mid, "type": mtype, "to": "小一", "peer_id": "n-d8a1a6ae",
+                "created_at": created, "body": "hi"}
+
+    def _write_outbox(self, msg):
+        p = self.tmp / "outbox" / f"{msg['id']}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(msg))
+        return p
+
+    def test_resend_delay(self):
+        self.assertEqual(relay.resend_delay(0), 60)
+        self.assertEqual(relay.resend_delay(1), 120)
+        self.assertEqual(relay.resend_delay(2), 240)
+        self.assertEqual(relay.resend_delay(3), 480)
+        self.assertEqual(relay.resend_delay(4), 900)
+        self.assertEqual(relay.resend_delay(10), 900)
+
+    def test_resend_backoff_and_age(self):
+        peer = {"peer_id": "n-d8a1a6ae", "node_name": "小一"}
+        msg = self._msg("msg-backoff1", age_s=3600)
+        self._write_outbox(msg)
+        state = {"acked_ids": [], "attempts": {"msg-backoff1": {"count": 1, "last": relay.now_ts()}},
+                 "processed_ids": []}
+        (self.tmp / "transport" / "state.json").write_text(json.dumps(state))
+        with mock.patch.object(relay, "get_peer", return_value=peer), \
+             mock.patch.object(relay, "transport_publish_envelope", return_value=True) as pub:
+            relay.resend_unacked()
+            pub.assert_not_called()  # within backoff (120 s for count 1)
+        # Old enough: publishes once and counts the attempt.
+        state["attempts"]["msg-backoff1"]["last"] = relay.now_ts() - 3600
+        (self.tmp / "transport" / "state.json").write_text(json.dumps(state))
+        relay._STATE_CACHE.update({"data": None, "written": None})
+        with mock.patch.object(relay, "get_peer", return_value=peer), \
+             mock.patch.object(relay, "transport_publish_envelope", return_value=True) as pub:
+            relay.resend_unacked()
+            pub.assert_called_once()
+
+    def test_resend_dead_letters_only_after_12h(self):
+        peer = {"peer_id": "n-d8a1a6ae", "node_name": "小一"}
+        old = self._msg("msg-old1", age_s=13 * 3600)
+        self._write_outbox(old)
+        (self.tmp / "transport" / "state.json").write_text(
+            json.dumps({"acked_ids": [], "attempts": {}, "processed_ids": []}))
+        with mock.patch.object(relay, "get_peer", return_value=peer), \
+             mock.patch.object(relay, "transport_publish_envelope", return_value=True) as pub, \
+             mock.patch.object(relay, "log") as log_mock:
+            relay.resend_unacked()
+            pub.assert_not_called()
+            self.assertTrue(any(c.args and c.args[0] == "dead_letter"
+                                for c in log_mock.call_args_list))
+
+    def test_resend_includes_ack(self):
+        peer = {"peer_id": "n-d8a1a6ae", "node_name": "小一"}
+        ack = self._msg("msg-ack1", mtype="ack", age_s=60)
+        self._write_outbox(ack)
+        (self.tmp / "transport" / "state.json").write_text(
+            json.dumps({"acked_ids": [], "attempts": {}, "processed_ids": []}))
+        with mock.patch.object(relay, "get_peer", return_value=peer), \
+             mock.patch.object(relay, "transport_publish_envelope", return_value=True) as pub:
+            relay.resend_unacked()
+            pub.assert_called_once()
+
+    def test_flush_flag_on_recovery(self):
+        base = "https://ntfy.envs.net"
+        (self.tmp / "transport" / "health.json").write_text(json.dumps(
+            {base: {"ok": 0, "fail": 5, "consecutive_fail": 5,
+                    "unhealthy_until": relay.now_ts() + 300, "last_error": "x"}}))
+        relay._FLUSH_NEEDED = False
+        relay.record_transport_success(base)
+        self.assertTrue(relay._FLUSH_NEEDED)
+        relay._FLUSH_NEEDED = False
+
+    def test_curl_stream_handles_events(self):
+        lines = ['{"event":"keepalive"}',
+                 '{"id":"ev1","event":"message","message":{"id":"msg-x","type":"message"}}']
+        stop = mock.Mock()
+        stop.is_set.side_effect = [False, False, False, True]
+        stop.wait.return_value = None
+        with mock.patch.object(relay.shutil, "which", return_value="/usr/bin/curl"), \
+             mock.patch.object(relay, "_stream_lines_curl",
+                               return_value=iter(lines)), \
+             mock.patch.object(relay, "handle_event_net", return_value=True) as handled, \
+             mock.patch.object(relay, "poll_topic", return_value=0):
+            relay.stream_topic("some-topic", "direct", "https://ntfy.envs.net", stop)
+        self.assertTrue(handled.called)
+        ev = handled.call_args_list[0].args[0]
+        self.assertEqual(ev["id"], "ev1")

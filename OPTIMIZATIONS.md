@@ -130,3 +130,41 @@ copy of `relay.py`. To upgrade a peer (e.g. 小一):
    builds interoperate on the same network.
 
 Original unoptimised copy is kept as `relay.py.v6-orig` in this folder.
+
+
+## Round 5 — survive multi-hour transport outages (2026-11-16)
+
+Diagnosis first, code second. On 2026-11-16 ~10:00, while the
+transport was in a good window, every check passed: curl and urllib
+both 10/10 sequential and concurrent on both ntfy bases, doctor
+publish+poll OK, and a `curl -N` stream held 90 s with keepalives.
+Minutes later the same calls failed with SSL WRONG_VERSION_NUMBER
+in both clients. Conclusion: the outage is episodic — good windows
+alternate with multi-hour bad windows in which every CONNECT through
+the shared egress proxy fails. Neither curl nor urllib fixes that;
+the code has to outlast the bad windows and exploit the good ones.
+
+Changes (wire format unchanged):
+- Resends use exponential backoff (60 s -> 2 min -> 4 min -> 8 min ->
+  15 min cap) and keep trying for the full 12 h ntfy cache window.
+  Dead-letter only happens when a message ages out of the cache —
+  the old 10-tries (~10 min) cap killed messages while the outage
+  was still going. Ack messages are now resent too (round 4 found
+  two acks that were never retried); heartbeats are still skipped.
+- Flush on recovery: when a base goes from unhealthy to healthy,
+  the outbox is flushed immediately instead of waiting for the next
+  resend tick.
+- Streams use curl (`curl -s -N --max-time 300`) with urllib as
+  fallback — one CONNECT per stream instead of reconnect churn.
+- Mirror poll 30 s -> 60 s.
+
+Round 5b (found live the same morning): the watch loop itself
+blocked. After restarting on round-5 code, the watcher wrote one
+liveness tick and went silent for 8 minutes — the main loop was
+stuck in resend -> publish -> http(), ~4 min per message in a bad
+window. Fixes: publish/poll use timeout 10 s and 1 retry; resends
+run in a background thread (at most one at a time); liveness ticks
+run in their own thread every 60 s, so the diagnostics log stays
+accurate even when the loop is busy. Verified live: ticks continued
+every 60 s through a bad window (consecutive_fail 48), and the
+resend thread attempted all 8 queued messages including acks.
