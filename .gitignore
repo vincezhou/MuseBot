@@ -12,5 +12,7 @@ files/
 presence.json
 processing_state.json
 messages.log.jsonl
+liveness.jsonl
+liveness.jsonl.1
 vendor/
 __pycache__/

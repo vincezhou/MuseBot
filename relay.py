@@ -48,6 +48,13 @@ PEERS_F = BASE / "peers.json"
 DIRECT_SENT_F = BASE / "files" / "direct_sent.json"
 LOG = BASE / "messages.log.jsonl"
 HEALTH_F = BASE / "transport" / "health.json"
+# Local diagnostics log: one small line per minute while the watcher
+# is alive, plus one line per (re)start. Lives in home, so it survives
+# a VM replacement that wipes /etc (where the systemd unit lives).
+LIVENESS_F = BASE / "liveness.jsonl"
+LIVENESS_STATE_F = BASE / "transport" / "liveness_state.json"
+MAX_LIVENESS_BYTES = 5 * 1024 * 1024  # ~11 days of 60 s ticks
+LIVENESS_GAP_SECS = 120  # a gap longer than this means the watcher was down
 NTFY_BASE = "https://ntfy.envs.net"
 NTFY_MIRROR = "https://ntfy.adminforge.de"
 TYPES = ["handshake", "message", "ack", "ping", "heartbeat", "file",
@@ -1116,6 +1123,207 @@ def resend_unacked():
         with _lock:
             s = load_state(); s["attempts"] = attempts; save_state(s)
 
+# ---------------- local diagnostics log ----------------
+
+def _read_first_line(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip().splitlines()[0]
+    except Exception:
+        return ""
+
+
+def machine_info():
+    """Machine identity for downtime analysis. No secrets: only ids
+    and booleans, never proxy credentials or network codes."""
+    boot_id = _read_first_line("/proc/sys/kernel/random/boot_id")
+    machine_id = _read_first_line("/etc/machine-id")
+    uptime_s = None
+    try:
+        uptime_s = float(Path("/proc/uptime").read_text().split()[0])
+    except Exception:
+        pass
+    return {"boot_id": boot_id or None, "machine_id": machine_id or None,
+            "hostname": socket.gethostname(), "uptime_s": uptime_s,
+            "pid": os.getpid(), "python": sys.version.split()[0],
+            "curl": bool(shutil.which("curl")),
+            "proxy_env": bool(os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY"))}
+
+
+def _liveness_state():
+    try:
+        return json.loads(LIVENESS_STATE_F.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_liveness_state(state):
+    try:
+        LIVENESS_STATE_F.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LIVENESS_STATE_F.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(LIVENESS_STATE_F)
+    except Exception:
+        pass
+
+
+def _append_liveness(entry):
+    try:
+        if LIVENESS_F.exists() and LIVENESS_F.stat().st_size > MAX_LIVENESS_BYTES:
+            shutil.move(str(LIVENESS_F), str(LIVENESS_F.with_suffix(".jsonl.1")))
+        with LIVENESS_F.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def classify_startup(prev, info, gap_s):
+    """Why did the watcher (re)start? Pure function, unit-tested.
+
+    prev: previous liveness state (may be empty). gap_s: seconds since
+    the last tick, None on first ever start.
+    """
+    if not prev or gap_s is None:
+        return "first_start"
+    if prev.get("boot_id") and info.get("boot_id") and prev["boot_id"] != info["boot_id"]:
+        return "machine_reboot_or_replace"
+    if gap_s <= LIVENESS_GAP_SECS:
+        return "clean_restart"
+    return "process_down"
+
+
+def record_startup():
+    """Called once when the watcher starts. Logs the verdict so a
+    later `diagnose` can say whether the machine rebooted, the
+    process died, or the restart was clean."""
+    info = machine_info()
+    prev = _liveness_state()
+    gap_s = round(now_ts() - prev["last_tick_ts"]) if prev.get("last_tick_ts") else None
+    verdict = classify_startup(prev, info, gap_s)
+    entry = {"ts": now_iso(), "event": "startup", "verdict": verdict,
+             "gap_s": gap_s, "prev_boot_id": prev.get("boot_id"),
+             "machine_id_changed": bool(prev.get("machine_id") and info.get("machine_id")
+                                       and prev["machine_id"] != info["machine_id"]),
+             **info}
+    _append_liveness(entry)
+    log("watcher_startup", verdict=verdict, gap_s=gap_s,
+        machine_id_changed=entry["machine_id_changed"])
+    _save_liveness_state({"boot_id": info["boot_id"], "machine_id": info["machine_id"],
+                          "last_tick_ts": now_ts()})
+    return entry
+
+
+def record_liveness_tick():
+    """One 60 s heartbeat line: proves the watcher was alive at this
+    instant, with enough context to judge the transport then."""
+    info = machine_info()
+    try:
+        rss_mb = int(Path(f"/proc/{os.getpid()}/status").read_text().split("VmRSS:")[1].split()[0]) // 1024
+    except Exception:
+        rss_mb = None
+    health = load_health()
+    peers = load_peers()
+    pres = load_presence()
+    entry = {"ts": now_iso(), "event": "tick", "boot_id": info["boot_id"],
+             "uptime_s": info["uptime_s"], "pid": info["pid"], "rss_mb": rss_mb,
+             "peers_online": [pr["node_name"] for pr in peers if peer_online(pr["peer_id"])],
+             "peers_offline": [pr["node_name"] for pr in peers if not peer_online(pr["peer_id"])],
+             "outbox": len(list(OUTBOX.glob("*.json"))) if OUTBOX.exists() else 0,
+             "health": {b: {"ok": h.get("ok", 0), "fail": h.get("fail", 0),
+                            "consecutive_fail": h.get("consecutive_fail", 0)}
+                        for b, h in health.items()}}
+    _append_liveness(entry)
+    _save_liveness_state({"boot_id": info["boot_id"], "machine_id": info["machine_id"],
+                          "last_tick_ts": now_ts()})
+    return entry
+
+
+def classify_gap(prev_tick, next_tick):
+    """Classify one gap between two consecutive liveness lines.
+    Returns None for a normal (<=120 s) interval."""
+    if not prev_tick or not next_tick:
+        return None
+    try:
+        gap = (datetime.fromisoformat(next_tick["ts"]) - datetime.fromisoformat(prev_tick["ts"])).total_seconds()
+    except Exception:
+        return None
+    if gap <= LIVENESS_GAP_SECS:
+        return None
+    if next_tick.get("event") == "startup":
+        return {"start": prev_tick["ts"], "end": next_tick["ts"], "gap_s": round(gap),
+                "cause": next_tick.get("verdict", "unknown"),
+                "machine_id_changed": next_tick.get("machine_id_changed", False)}
+    if prev_tick.get("boot_id") and next_tick.get("boot_id") and prev_tick["boot_id"] != next_tick["boot_id"]:
+        cause = "machine_reboot_or_replace"
+    else:
+        cause = "process_down"
+    return {"start": prev_tick["ts"], "end": next_tick["ts"], "gap_s": round(gap), "cause": cause,
+            "machine_id_changed": False}
+
+
+def cmd_diagnose(args):
+    """Read the local diagnostics log and explain past downtime.
+
+    Prints JSON: startup verdicts, every downtime gap with its
+    classified cause, transport-error counts in the 5 minutes before
+    each gap (a gap preceded by transport errors is likely the
+    egress proxy, not the machine), and current status.
+    """
+    ticks = []
+    try:
+        for line in LIVENESS_F.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                ticks.append(json.loads(line))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    startups = [t for t in ticks if t.get("event") == "startup"]
+    gaps = []
+    for a, b in zip(ticks, ticks[1:]):
+        g = classify_gap(a, b)
+        if g:
+            gaps.append(g)
+    # Transport errors shortly before each gap: were we already
+    # failing to reach ntfy when the watcher went quiet?
+    err_ts = []
+    try:
+        for line in LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-5000:]:
+            if "WRONG_VERSION_NUMBER" in line or '"transport_failed"' in line:
+                try:
+                    err_ts.append(datetime.fromisoformat(json.loads(line)["ts"]))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    for g in gaps:
+        try:
+            start = datetime.fromisoformat(g["start"])
+            g["transport_errors_5min_before"] = sum(
+                0 <= (start - e).total_seconds() <= 300 for e in err_ts)
+        except Exception:
+            g["transport_errors_5min_before"] = None
+    info = machine_info()
+    health = load_health()
+    report = {
+        "now": now_iso(), "boot_id": info["boot_id"], "uptime_s": info["uptime_s"],
+        "machine_id": info["machine_id"], "pid": info["pid"],
+        "watcher_running": True,  # diagnose itself runs, so the relay code is alive here
+        "liveness_lines": len(ticks),
+        "first_tick": ticks[0]["ts"] if ticks else None,
+        "last_tick": ticks[-1]["ts"] if ticks else None,
+        "startups": [{"ts": s["ts"], "verdict": s.get("verdict"),
+                      "gap_s": s.get("gap_s"),
+                      "machine_id_changed": s.get("machine_id_changed")} for s in startups],
+        "downtime_gaps": gaps,
+        "total_downtime_s": sum(g["gap_s"] for g in gaps),
+        "health": health,
+        "peers": [{"node_name": pr.get("node_name"),
+                   "online": bool(peer_online(pr["peer_id"]))} for pr in load_peers()],
+        "unacked": len([f for f in OUTBOX.glob("*.json")]) if OUTBOX.exists() else 0,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 def cmd_watch(args):
     """Resident watcher (network v6 only).
 
@@ -1126,6 +1334,7 @@ def cmd_watch(args):
     if not network_mode():
         print(json.dumps({"ok": False, "reason": "network_mode is off: this build is v6 network only"}))
         sys.exit(1)
+    record_startup()
     stop = threading.Event()
     threads = []
     code = network_code()
@@ -1135,12 +1344,14 @@ def cmd_watch(args):
         t = threading.Thread(target=stream_topic, args=(topic, via, NTFY_BASE, stop), daemon=True)
         t.start(); threads.append(t)
     print(f"watching network streams ({len(threads)}) + local folders", flush=True)
-    last_beat = 0; last_resend = 0; last_mirror_poll = 0
+    last_beat = 0; last_resend = 0; last_mirror_poll = 0; last_tick = 0
     try:
         while True:
             for p in sorted(FROM_PEER.glob("*.json")):
                 ingest_file(p)
             retry_pending()
+            if now_ts() - last_tick > 60:
+                record_liveness_tick(); last_tick = now_ts()
             if now_ts() - last_mirror_poll > 30:
                 for topic, via in topics:
                     try:
@@ -1754,6 +1965,7 @@ def main():
     cw = sub.add_parser("check-work"); cw.set_defaults(fn=cmd_check_work)
     stt = sub.add_parser("status"); stt.set_defaults(fn=cmd_status)
     dc = sub.add_parser("doctor"); dc.set_defaults(fn=cmd_doctor)
+    dg = sub.add_parser("diagnose"); dg.set_defaults(fn=cmd_diagnose)
     w = sub.add_parser("watch"); w.add_argument("--interval", type=int, default=15,
         help="legacy; streaming makes polling interval unnecessary")
     w.set_defaults(fn=cmd_watch)

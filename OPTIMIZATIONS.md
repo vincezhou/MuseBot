@@ -94,6 +94,28 @@ plain-HTTP error on CONNECT, and which calls survive is luck of the
 draw. The 4 upgrade messages to 小一 are at 5 resend tries each and
 still unacked; 小一 has been offline since 01:25:20.
 
+## Round 4 — local diagnostics log (2026-11-16)
+
+Vince's ask: when the machine running the service sleeps and the
+process dies, the later logs must be able to pinpoint that cause —
+logs as complete as possible, for later analysis.
+
+A dead process cannot log its own death, so the watcher now proves
+it is alive instead: every 60 s it appends one line to
+`liveness.jsonl` (in home, survives VM replacement) with boot id,
+uptime, pid, memory, peers online/offline, outbox depth and per-base
+transport health; at every start it records a startup line with a
+verdict — `first_start`, `clean_restart` (same boot, short gap),
+`process_down` (same boot, long gap: the watcher died while the
+machine stayed up), `machine_reboot_or_replace` (boot id changed;
+plus `machine_id_changed` when /etc/machine-id changed too, which
+is the VM-replacement signal). `relay.py diagnose` reads the log and
+reports every downtime gap with its classified cause, plus how many
+transport errors happened in the 5 minutes before each gap (a gap
+preceded by transport errors points at the egress proxy, not the
+machine). 4 more tests, total **30/30 pass**. Live check: the second
+restart classified itself `clean_restart` (gap 25 s, same boot id).
+
 ## How a peer upgrades (manual, not automatic)
 
 There is **no auto-upgrade** in MuseBot: each node runs its own local

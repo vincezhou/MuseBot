@@ -363,3 +363,78 @@ class TestCurlPrimary(BaseTest):
              mock.patch.object(relay, "_http_via_curl", side_effect=AssertionError("curl must not be called")), \
              mock.patch.object(relay.urllib.request, "urlopen", lambda *a, **k: Resp()):
             self.assertEqual(relay.http("GET", "https://example.invalid/x"), b"via-urllib")
+
+
+class TestLiveness(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.live = self.tmp / "liveness.jsonl"
+        self.lstate = self.tmp / "transport" / "liveness_state.json"
+        self._live_patch = mock.patch.object(relay, "LIVENESS_F", self.live)
+        self._state_patch = mock.patch.object(relay, "LIVENESS_STATE_F", self.lstate)
+        self._live_patch.start()
+        self._state_patch.start()
+
+    def tearDown(self):
+        self._live_patch.stop()
+        self._state_patch.stop()
+        super().tearDown()
+
+    def test_classify_startup(self):
+        info = {"boot_id": "boot-A", "machine_id": "m-1"}
+        self.assertEqual(relay.classify_startup({}, info, None), "first_start")
+        self.assertEqual(relay.classify_startup({"boot_id": "boot-A"}, info, 30), "clean_restart")
+        self.assertEqual(relay.classify_startup({"boot_id": "boot-A"}, info, 600), "process_down")
+        self.assertEqual(relay.classify_startup({"boot_id": "boot-B"}, info, 600),
+                         "machine_reboot_or_replace")
+
+    def test_classify_gap(self):
+        a = {"ts": "2026-11-16T01:00:00+08:00", "event": "tick", "boot_id": "boot-A"}
+        b = {"ts": "2026-11-16T01:01:00+08:00", "event": "tick", "boot_id": "boot-A"}
+        self.assertIsNone(relay.classify_gap(a, b))
+        c = {"ts": "2026-11-16T01:30:00+08:00", "event": "tick", "boot_id": "boot-A"}
+        g = relay.classify_gap(a, c)
+        self.assertEqual(g["cause"], "process_down")
+        self.assertEqual(g["gap_s"], 1800)
+        d = {"ts": "2026-11-16T01:30:00+08:00", "event": "tick", "boot_id": "boot-B"}
+        self.assertEqual(relay.classify_gap(a, d)["cause"], "machine_reboot_or_replace")
+        e = {"ts": "2026-11-16T01:30:00+08:00", "event": "startup",
+             "verdict": "machine_reboot_or_replace", "machine_id_changed": True}
+        g2 = relay.classify_gap(a, e)
+        self.assertEqual(g2["cause"], "machine_reboot_or_replace")
+        self.assertTrue(g2["machine_id_changed"])
+
+    def test_startup_then_tick_then_reboot_verdict(self):
+        info_a = {"boot_id": "boot-A", "machine_id": "m-1", "hostname": "h",
+                  "uptime_s": 100.0, "pid": 1, "python": "3.12", "curl": True, "proxy_env": True}
+        with mock.patch.object(relay, "machine_info", return_value=info_a):
+            first = relay.record_startup()
+        self.assertEqual(first["verdict"], "first_start")
+        with mock.patch.object(relay, "machine_info", return_value=info_a):
+            relay.record_liveness_tick()
+        lines = self.live.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[1])["event"], "tick")
+        self.assertIsInstance(json.loads(lines[1])["rss_mb"], int)
+        self.assertGreater(json.loads(lines[1])["rss_mb"], 0)
+        # Simulate a reboot: new boot id, long gap since the tick.
+        state = json.loads(self.lstate.read_text())
+        state["last_tick_ts"] = relay.now_ts() - 3600
+        self.lstate.write_text(json.dumps(state))
+        info_b = dict(info_a, boot_id="boot-B", machine_id="m-2")
+        with mock.patch.object(relay, "machine_info", return_value=info_b):
+            second = relay.record_startup()
+        self.assertEqual(second["verdict"], "machine_reboot_or_replace")
+        self.assertTrue(second["machine_id_changed"])
+
+    def test_diagnose_reports_gap(self):
+        self.live.write_text(
+            '{"ts": "2026-11-16T01:00:00+08:00", "event": "tick", "boot_id": "boot-A"}\n'
+            '{"ts": "2026-11-16T01:30:00+08:00", "event": "tick", "boot_id": "boot-A"}\n')
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf):
+            relay.cmd_diagnose(None)
+        report = json.loads(buf.getvalue())
+        self.assertEqual(len(report["downtime_gaps"]), 1)
+        self.assertEqual(report["downtime_gaps"][0]["cause"], "process_down")
+        self.assertEqual(report["total_downtime_s"], 1800)

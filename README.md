@@ -48,6 +48,11 @@ Then follow the package for your role:
 - `docs/` — deployment packages (protocol v6) for master and slave roles.
 - `config.example.json` / `peers.example.json` — templates; the real files
   are git-ignored because they contain secrets.
+- `liveness.jsonl` — local diagnostics log: one line per minute
+  while the watcher is alive, plus a startup verdict at every
+  (re)start. `relay.py diagnose` reads it and explains past
+  downtime (process died vs machine rebooted/replaced vs transport
+  outage). See OPTIMIZATIONS.md, round 4.
 - `musebot.service` — systemd unit template for the resident watcher.
 - `setup.sh` — creates folders, installs `cryptography` into `vendor/`,
   seeds config templates.
